@@ -41,6 +41,7 @@ class MainActivity: Activity() {
   button(col,"开始翻译 / 申请录屏授权") { begin() }
   button(col,"停止翻译") { stopService(Intent(this,CaptureService::class.java)) }
   button(col,"切换到麦克风模式并开始") { switchToMic() }
+  button(col,"导出逐字稿（历史记录）") { sessions() }
   button(col,"设置") { settings() }
   handler.removeCallbacks(refresh); handler.post(refresh)
  }
@@ -67,6 +68,29 @@ class MainActivity: Activity() {
  }
  override fun onActivityResult(requestCode:Int,resultCode:Int,data:Intent?) { super.onActivityResult(requestCode,resultCode,data); if(requestCode==20 && resultCode==RESULT_OK && data!=null) launch(data,resultCode) else if(requestCode==20) toast("已取消录屏授权") }
  private fun toast(s:String) { Toast.makeText(this,s,Toast.LENGTH_LONG).show() }
+ private fun sessions() {
+  handler.removeCallbacks(refresh)
+  val col=layout("逐字稿 · 历史记录")
+  col.addView(TextView(this).apply { text="每次“开始翻译”到“停止”为一期。点选一期，再选择导出格式。断句按说话停顿；中文为整句翻译，停止后几秒内补全。" })
+  val list=Session.list(this)
+  if(list.isEmpty()) col.addView(TextView(this).apply { text="\n暂无记录。开始翻译并说话/播放视频后会自动记录。"; setPadding(0,20,0,20) })
+  list.forEach { s -> val sec=s.durationMs/1000; button(col,"${s.title}　${s.count()} 句　${sec/60}分${sec%60}秒") { detail(s) } }
+  button(col,"返回") { main() }
+ }
+ private fun detail(s:Session) {
+  val col=layout("导出逐字稿")
+  col.addView(TextView(this).apply { text="${s.title}　共 ${s.count()} 句" })
+  fun spin(title:String,values:Array<String>):Spinner { col.addView(TextView(this).apply { text=title;setPadding(0,16,0,0) }); return Spinner(this).apply { adapter=ArrayAdapter(this@MainActivity,android.R.layout.simple_spinner_dropdown_item,values) }.also { col.addView(it) } }
+  val fmt=spin("内容",Exporter.formats); val typ=spin("文件类型（srt 带时间轴字幕）",Exporter.types)
+  val preview=TextView(this).apply { setTextIsSelectable(true); setPadding(0,16,0,16) }
+  fun text()=Exporter.build(s,Exporter.formats[fmt.selectedItemPosition],Exporter.types[typ.selectedItemPosition])
+  button(col,"预览") { val t=text(); preview.text=if(t.length>3000) t.take(3000)+"\n…（预览仅前 3000 字）" else t }
+  button(col,"保存到“下载/X实时翻译”") { try { toast("已保存：${Exporter.saveToDownloads(this,Exporter.fileName(s,Exporter.formats[fmt.selectedItemPosition],Exporter.types[typ.selectedItemPosition]),text(),Exporter.types[typ.selectedItemPosition])}") } catch(e:Exception) { toast("保存失败：${e.message}") } }
+  button(col,"分享 / 发送到其他应用") { startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_SUBJECT,Exporter.fileName(s,Exporter.formats[fmt.selectedItemPosition],Exporter.types[typ.selectedItemPosition])).putExtra(Intent.EXTRA_TEXT,text()),"分享逐字稿")) }
+  button(col,"删除这一期") { AlertDialog.Builder(this).setMessage("确定删除这一期记录？").setPositiveButton("删除") { _,_ -> s.delete();sessions() }.setNegativeButton("取消",null).show() }
+  button(col,"返回列表") { sessions() }
+  col.addView(preview)
+ }
  private fun settings() {
   handler.removeCallbacks(refresh)
   val col=layout("设置")

@@ -26,6 +26,10 @@ class CaptureService: Service() {
  private var en="正在准备英文识别…"
  private var zh=""
  private var lastFinal=""
+ private var session:Session?=null
+ private var tBuilder:TranscriptBuilder?=null
+ private var tTranslator:Translation?=null
+ private val tExec=Executors.newSingleThreadExecutor()
  private var shownId=0L
  private var hasTranslation=false
  private companion object { const val PARTIAL_INTERVAL_MS=450L;const val MAX_UTTERANCE_MS=3500L;const val MAX_UTTERANCE_WORDS=13 }
@@ -49,6 +53,9 @@ class CaptureService: Service() {
     projection!!.registerCallback(object:MediaProjection.Callback() { override fun onStop() { if(active) { update("录屏授权已终止");stopSelf() } } },main)
    }
    translator=Translation(cfg)
+   tTranslator=Translation(cfg)
+   val sess=Session.create(this);session=sess
+   tBuilder=TranscriptBuilder { seg -> transcribe(sess,seg) }
    audioThread=Thread({ capture(mic) },"audio-vosk").also { it.start() }
   } catch(e:Exception) { update("启动失败：${e.message}");stopSelf() }
   return START_NOT_STICKY
@@ -65,7 +72,7 @@ class CaptureService: Service() {
  private fun capture(mic:Boolean) {
   var model:Model?=null;var recognizer:Recognizer?=null;var local:AudioRecord?=null
   try {
-   model=Model(Config.model(this).absolutePath);recognizer=Recognizer(model,16000f)
+   model=Model(Config.model(this).absolutePath);recognizer=Recognizer(model,16000f);recognizer.setWords(true)
    val format=AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(16000).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()
    val minimum=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT)
    check(minimum>0) { "设备不支持 16kHz 单声道录音" }
@@ -80,12 +87,14 @@ class CaptureService: Service() {
    update("正在聆听英语；${if(mic) "请使用外放" else "请播放 X 视频"}")
    val data=ByteArray(3200)
    var lastSound=SystemClock.elapsedRealtime();var lastPartial=0L;var warned=false;var errors=0
-   var uttStart=0L;var lastSubmitText="";var lastSubmitWords=0;var lastSubmitAt=0L
+   var samples=0L;var uttStart=0L;var lastSubmitText="";var lastSubmitWords=0;var lastSubmitAt=0L
    while(active) {
     val n=local.read(data,0,data.size,AudioRecord.READ_BLOCKING)
     if(!active) break
     if(n<0) { errors++;if(errors>5) error("音频读取失败（$n），请停止后重试或切换麦克风");Thread.sleep(40);continue }
     errors=0
+    samples+=n/2
+    val audioSec=samples/16000.0
     val now=SystemClock.elapsedRealtime()
     var energy=0L
     for(i in 0 until n-1 step 2) { val sample=((data[i].toInt() and 255) or (data[i+1].toInt() shl 8)).toShort().toInt(); energy+=abs(sample) }
@@ -96,7 +105,8 @@ class CaptureService: Service() {
     if(now-lastSound>10000 && !warned) { warned=true;update(if(mic) "持续无声：请检查麦克风权限、外放音量及距离" else "持续无声：X 可能禁止音频捕获，或视频已静音。点击“麦克风”回主界面切换模式") }
     if(n==0) { Thread.sleep(20);continue }
     if(recognizer.acceptWaveForm(data,n)) {
-     val text=JSONObject(recognizer.result).optString("text")
+     val json=recognizer.result;val text=JSONObject(json).optString("text")
+     try { tBuilder?.add(json,audioSec,true) } catch(_:Exception) {}
      if(text.isNotBlank() && text!=lastFinal) { lastFinal=text;submit(text) }
      uttStart=0L;lastSubmitText="";lastSubmitWords=0
     } else if(now-lastPartial>=150) {
@@ -106,7 +116,9 @@ class CaptureService: Service() {
       val words=text.trim().split(Regex("\\s+")).size
       if(now-uttStart>=MAX_UTTERANCE_MS || words>=MAX_UTTERANCE_WORDS) {
        // Long speech without a pause: force the recognizer to commit what it has so far.
-       val forced=JSONObject(recognizer.finalResult).optString("text").ifBlank { text }
+       val fjson=recognizer.finalResult
+       try { tBuilder?.add(fjson,audioSec,false) } catch(_:Exception) {}
+       val forced=JSONObject(fjson).optString("text").ifBlank { text }
        if(forced!=lastFinal) { lastFinal=forced;submit(forced) }
        uttStart=0L;lastSubmitText="";lastSubmitWords=0
       } else {
@@ -119,8 +131,19 @@ class CaptureService: Service() {
      }
     }
    }
+   // Stopped: flush the last words so the transcript is complete.
+   try { val last=recognizer.finalResult;tBuilder?.add(last,samples/16000.0,true) } catch(_:Exception) {}
   } catch(e:Exception) { if(active) { update("捕获/识别失败：${e.message}"); main.post { stopSelf() } } }
-  finally { try { local?.stop() } catch(_:Exception) {};local?.release();record=null;recognizer?.close();model?.close() }
+  finally { try { tBuilder?.flush() } catch(_:Exception) {};try { local?.stop() } catch(_:Exception) {};local?.release();record=null;recognizer?.close();model?.close() }
+ }
+ // Transcript sentences (pause-based) are translated in full, in the background, in order.
+ private fun transcribe(sess:Session,seg:Seg) {
+  val idx=sess.add(seg)
+  try { tExec.execute {
+   for(attempt in 0..2) {
+    try { val z=tTranslator?.translate(seg.en) ?: return@execute;sess.setZh(idx,z);return@execute } catch(e:Exception) { try { Thread.sleep(1500L*(attempt+1)) } catch(_:InterruptedException) { return@execute } }
+   }
+  } } catch(_:RejectedExecutionException) {}
  }
  // Start of a new sentence: the finished one moves to the faded line above; current lines are cleared.
  private fun rollover(rid:Long) {
@@ -145,8 +168,16 @@ class CaptureService: Service() {
   overlay?.close();overlay=null
   queue.shutdownNow()
   // Let the worker release its recognizer/model; never free native handles while reading.
-  val engine=translator
-  Thread { try { audioThread?.join(3000);queue.awaitTermination(3,TimeUnit.SECONDS) } catch(_:InterruptedException) {};engine?.close() }.start()
+  val engine=translator;val tEngine=tTranslator;val sess=session
+  Thread {
+   try { audioThread?.join(3000);queue.awaitTermination(3,TimeUnit.SECONDS) } catch(_:InterruptedException) {}
+   engine?.close()
+   // Let pending transcript translations finish (up to 60 s) before releasing the translator.
+   tExec.shutdown()
+   try { tExec.awaitTermination(60,TimeUnit.SECONDS) } catch(_:InterruptedException) {}
+   tEngine?.close()
+   if(sess!=null && sess.count()==0) sess.delete()
+  }.start()
   stopForeground(STOP_FOREGROUND_REMOVE)
   super.onDestroy()
  }
